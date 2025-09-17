@@ -81,7 +81,14 @@ async def mcp_info():
         "jsonrpc": "2.0",
         "result": {
             "capabilities": {
-                "tools": {}
+                "tools": {
+                    "search": {
+                        "description": "Search for SEO insights and web intelligence data"
+                    },
+                    "fetch": {
+                        "description": "Retrieve detailed SEO analysis by ID"
+                    }
+                }
             },
             "serverInfo": {
                 "name": "ChatGPT FetchSERP Server",
