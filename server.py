@@ -294,4 +294,4 @@ if __name__ == "__main__":
     print("✅ Optimized for ChatGPT Deep Research")
     
     # Run with HTTP transport for ChatGPT compatibility
-    server.run(transport="http", port=PORT)
+    server.run(transport="http", host="0.0.0.0", port=PORT)
