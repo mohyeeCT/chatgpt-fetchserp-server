@@ -1,37 +1,41 @@
 #!/usr/bin/env python3
 """
-FetchSERP MCP server exposing core endpoints as MCP tools.
+Minimal FetchSERP MCP server:
+- Only two tools exposed to ChatGPT: `search` and `fetch`.
+- `search` returns keyword search volume using GET /api/v1/keywords_search_volume.
+- `fetch` scrapes a URL using GET /api/v1/scrape.
+- Compatible with MCP over HTTP as used by ChatGPT connectors:
+  * POST JSON-RPC 2.0 at /mcp and /mcp/
+  * initialize -> tools/list -> tools/call
+  * Version negotiation and MCP-Protocol-Version header per spec.
 
-Fixes in v1.2.4
-- Echo client's protocolVersion in initialize if supported, else fall back to latest
-- Add prompts/resources handlers that return empty lists instead of -32601
-- Add resources/read and prompts/get stubs
-- Add global MCP-Protocol-Version header on every response
-- Add GET and HEAD banners on /mcp and /mcp/
-- Keep search/fetch and all FetchSERP endpoints, plus keyword aliases
+Env:
+- FETCHSERP_API_TOKEN required
+- FETCHSERP_BASE_URL optional. Defaults to https://www.fetchserp.com
+
+Run:
+uvicorn server_min_kv_fetch:app --host 0.0.0.0 --port $PORT
 """
 import os
 import json
-import time
-import hashlib
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import httpx
 from fastapi import FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
-APP_NAME = "FetchSERP MCP Server"
-APP_VERSION = "1.2.4"
+APP_NAME = "FetchSERP MCP Server - Minimal KV+Fetch"
+APP_VERSION = "0.2.0"
+
+# MCP protocol
 LATEST_PROTOCOL = "2025-06-18"
 SUPPORTED_PROTOCOLS = {LATEST_PROTOCOL, "2025-03-26", "2024-11-05"}
 
+# Config
 FETCHSERP_API_TOKEN = os.getenv("FETCHSERP_API_TOKEN")
 FETCHSERP_BASE_URL = os.getenv("FETCHSERP_BASE_URL", "https://www.fetchserp.com")
-PORT = int(os.getenv("PORT", "8000"))
 
-SEARCH_TTL_SEC = 20 * 60
-SEARCH_INDEX: Dict[str, Dict[str, Any]] = {}
-
+# FastAPI app
 app = FastAPI(title=APP_NAME)
 
 app.add_middleware(
@@ -44,277 +48,156 @@ app.add_middleware(
 
 @app.middleware("http")
 async def add_protocol_header(request: Request, call_next):
-    # Ensure every response carries the protocol header
-    response = await call_next(request)
-    response.headers["MCP-Protocol-Version"] = LATEST_PROTOCOL
-    return response
+    resp = await call_next(request)
+    resp.headers["MCP-Protocol-Version"] = LATEST_PROTOCOL
+    return resp
 
-# ---------- Health ----------
+# -------------- Health and banners --------------
 @app.get("/")
-async def health_root():
+async def root():
     return {
         "ok": True,
         "app": APP_NAME,
         "version": APP_VERSION,
-        "mcp": {"protocolRevision": LATEST_PROTOCOL, "endpoints": ["/", "/mcp", "/mcp/"]},
+        "mcp": {"protocolRevision": LATEST_PROTOCOL, "endpoints": ["/mcp", "/mcp/"]},
     }
 
 @app.head("/")
 async def head_root():
     return Response(status_code=204)
 
-@app.get("/health")
-async def health():
-    return {"ok": True}
-
-@app.head("/health")
-async def head_health():
-    return Response(status_code=204)
-
-# Humans sometimes open /mcp in a browser. Give a banner.
 @app.get("/mcp")
 @app.get("/mcp/")
-async def mcp_get_banner():
+async def mcp_banner():
     return {"ok": True, "message": "MCP JSON-RPC endpoint. Use POST to call JSON-RPC.", "methods": ["POST"]}
 
 @app.head("/mcp")
 @app.head("/mcp/")
-async def mcp_head_banner():
+async def mcp_head():
     return Response(status_code=204)
 
-# ---------- HTTP client ----------
+# -------------- Helpers --------------
 def _client() -> httpx.AsyncClient:
-    headers = {"Authorization": f"Bearer {FETCHSERP_API_TOKEN}"} if FETCHSERP_API_TOKEN else {}
-    return httpx.AsyncClient(base_url=FETCHSERP_BASE_URL, headers=headers, timeout=90.0)
+    headers = {}
+    if FETCHSERP_API_TOKEN:
+        headers["Authorization"] = f"Bearer {FETCHSERP_API_TOKEN}"
+    return httpx.AsyncClient(base_url=FETCHSERP_BASE_URL, headers=headers, timeout=60.0)
 
-# ---------- JSON-RPC helpers ----------
 def _jsonrpc_result(id_value: Any, result: Dict[str, Any]) -> Dict[str, Any]:
     return {"jsonrpc": "2.0", "id": id_value, "result": result}
 
 def _jsonrpc_error(id_value: Any, code: int, message: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    err: Dict[str, Any] = {"jsonrpc": "2.0", "id": id_value, "error": {"code": code, "message": message}}
+    err = {"jsonrpc": "2.0", "id": id_value, "error": {"code": code, "message": message}}
     if data is not None:
         err["error"]["data"] = data
     return err
 
-# ---------- Endpoint map ----------
-ENDPOINTS = {
-    # meta-tools
-    "search": {"path": "/api/v1/serp", "method": "GET"},
-    "fetch": {"path": "/api/v1/scrape", "method": "GET"},
-
-    # core endpoints
-    "serp": {"path": "/api/v1/serp", "method": "GET"},
-    "ranking": {"path": "/api/v1/ranking", "method": "GET"},
-    "serp_html": {"path": "/api/v1/serp_html", "method": "GET"},
-    "serp_text": {"path": "/api/v1/serp_text", "method": "GET"},
-    "serp_js": {"path": "/api/v1/serp_js", "method": "GET"},
-    "serp_ai": {"path": "/api/v1/serp_ai", "method": "GET"},
-    "serp_ai_mode": {"path": "/api/v1/serp_ai_mode", "method": "GET"},
-    "page_indexation": {"path": "/api/v1/page_indexation", "method": "GET"},
-    "backlinks": {"path": "/api/v1/backlinks", "method": "GET"},
-    "keywords_search_volume": {"path": "/api/v1/keywords_search_volume", "method": "GET"},
-    "keywords_suggestions": {"path": "/api/v1/keywords_suggestions", "method": "GET"},
-    "long_tail_keywords_generator": {"path": "/api/v1/long_tail_keywords_generator", "method": "GET"},
-    "scrape": {"path": "/api/v1/scrape", "method": "GET"},
-    "scrape_js": {"path": "/api/v1/scrape_js", "method": "POST"},
-    "scrape_js_with_proxy": {"path": "/api/v1/scrape_js_with_proxy", "method": "POST"},
-    "domain_scraping": {"path": "/api/v1/scrape_domain", "method": "GET"},
-    "web_page_seo_analysis": {"path": "/api/v1/web_page_seo_analysis", "method": "GET"},
-    "web_page_ai_analysis": {"path": "/api/v1/web_page_ai_analysis", "method": "GET"},
-    "domain_infos": {"path": "/api/v1/domain_infos", "method": "GET"},
-    "domain_emails": {"path": "/api/v1/domain_emails", "method": "GET"},
-    "moz": {"path": "/api/v1/moz", "method": "GET"},
-
-    # aliases
-    "keyword_volume": {"path": "/api/v1/keywords_search_volume", "method": "GET"},
-    "keyword_suggestions": {"path": "/api/v1/keywords_suggestions", "method": "GET"},
-}
-
-# ---------- Tool list ----------
 def _tools_list_result() -> Dict[str, Any]:
     def obj(props, required=None, additional=True):
         return {"type": "object", "properties": props, "required": required or [], "additionalProperties": additional}
 
-    common_search_props = {
-        "query": {"type": "string"},
-        "search_engine": {"type": "string", "enum": ["google", "bing", "yahoo", "duckduckgo"], "default": "google"},
-        "country": {"type": "string", "default": "us"},
-        "pages_number": {"type": "integer", "minimum": 1, "maximum": 30, "default": 1},
+    return {
+        "tools": [
+            {
+                "name": "search",
+                "description": "Get keyword search volume. Wraps GET /api/v1/keywords_search_volume.",
+                "inputSchema": obj(
+                    {
+                        "keyword": {"type": "string", "description": "Keyword to look up"},
+                        "country": {"type": "string", "default": "us", "description": "Country code, for example us"},
+                        "language": {"type": "string", "default": "en", "description": "Language code"},
+                    },
+                    ["keyword"],
+                    additional=False,
+                ),
+            },
+            {
+                "name": "fetch",
+                "description": "Scrape a URL and return raw HTML using GET /api/v1/scrape.",
+                "inputSchema": obj(
+                    {
+                        "url": {"type": "string", "description": "Absolute URL to scrape"},
+                    },
+                    ["url"],
+                    additional=False,
+                ),
+            },
+        ]
     }
 
-    tools = [
-        {
-            "name": "search",
-            "description": "Search and return top result IDs. Wraps /api/v1/serp.",
-            "inputSchema": obj({**common_search_props, "top_k": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}}, ["query"]),
-        },
-        {
-            "name": "fetch",
-            "description": "Fetch full documents by IDs returned from search. Uses /api/v1/scrape.",
-            "inputSchema": obj({"ids": {"type": "array", "items": {"type": "string"}}}, ["ids"], additional=False),
-        },
-    ]
-
-    def add_passthrough(name, desc, props, req):
-        tools.append({"name": name, "description": desc, "inputSchema": obj(props, req)})
-
-    add_passthrough("serp", "Structured SERP results.", common_search_props, ["query"])
-    add_passthrough("ranking", "Domain ranking for a keyword.", {
-        "domain": {"type": "string"},
-        "keyword": {"type": "string"},
-        "country": {"type": "string", "default": "us"},
-        "search_engine": {"type": "string", "enum": ["google", "bing", "yahoo", "duckduckgo"], "default": "google"},
-        "pages_number": {"type": "integer", "minimum": 1, "maximum": 30, "default": 10},
-    }, ["domain", "keyword"])
-
-    for t in [
-        ("serp_html", "SERP with full HTML."),
-        ("serp_text", "SERP as extracted text."),
-        ("serp_js", "JS-rendered SERP job."),
-        ("serp_ai", "AI Overview + AI Mode."),
-    ]:
-        add_passthrough(t[0], t[1], common_search_props, ["query"])
-
-    add_passthrough("serp_ai_mode", "Cached US-only AI Mode.", {"query": {"type": "string"}}, ["query"])
-    add_passthrough("page_indexation", "Check page indexation status.", {"url": {"type": "string"}}, ["url"])
-    add_passthrough("backlinks", "Backlink data for a domain.", {"domain": {"type": "string"}}, ["domain"])
-    add_passthrough("keywords_search_volume", "Monthly search volume for a keyword.", {"keyword": {"type": "string"}}, ["keyword"])
-    add_passthrough("keywords_suggestions", "Keyword suggestions with metrics.", {"keyword": {"type": "string"}}, ["keyword"])
-    add_passthrough("long_tail_keywords_generator", "Generate long-tail keywords.", {"keyword": {"type": "string"}}, ["keyword"])
-    add_passthrough("scrape", "Scrape raw HTML.", {"url": {"type": "string"}}, ["url"])
-    add_passthrough("scrape_js", "Scrape with custom JS.", {"url": {"type": "string"}, "script": {"type": "string"}}, ["url"])
-    add_passthrough("scrape_js_with_proxy", "JS scrape via proxy.", {"url": {"type": "string"}, "script": {"type": "string"}}, ["url"])
-    add_passthrough("domain_scraping", "Crawl a domain.", {"domain": {"type": "string"}}, ["domain"])
-    add_passthrough("web_page_seo_analysis", "Technical and on-page SEO audit.", {"url": {"type": "string"}}, ["url"])
-    add_passthrough("web_page_ai_analysis", "AI-powered content analysis.", {"url": {"type": "string"}}, ["url"])
-    add_passthrough("domain_infos", "DNS, WHOIS, tech stack.", {"domain": {"type": "string"}}, ["domain"])
-    add_passthrough("domain_emails", "Extract emails from a domain.", {"domain": {"type": "string"}}, ["domain"])
-    add_passthrough("moz", "Moz authority and metrics.", {"domain": {"type": "string"}}, ["domain"])
-    add_passthrough("keyword_volume", "Alias of keywords_search_volume.", {"keyword": {"type": "string"}}, ["keyword"])
-    add_passthrough("keyword_suggestions", "Alias of keywords_suggestions.", {"keyword": {"type": "string"}}, ["keyword"])
-
-    return {"tools": tools}
-
-# ---------- Tool execution ----------
-async def _call_fetchserp(endpoint: str, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+async def _call_fetchserp(path: str, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
     async with _client() as client:
         if method == "GET":
-            r = await client.get(endpoint, params=params)
+            r = await client.get(path, params=params)
         else:
-            r = await client.post(endpoint, json=params)
+            r = await client.post(path, json=params)
         r.raise_for_status()
         return r.json()
 
-def _stable_id(url: str, position: int, query: str) -> str:
-    h = hashlib.sha1(f"{url}|{position}|{query}".encode("utf-8")).hexdigest()
-    return f"fsrp_{h[:24]}"
-
-def _purge_expired():
-    now = time.time()
-    expired = [k for k, v in SEARCH_INDEX.items() if now - v.get("ts", 0) > SEARCH_TTL_SEC]
-    for k in expired:
-        SEARCH_INDEX.pop(k, None)
-
+# -------------- Tool execution --------------
 async def _handle_tool_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     if not FETCHSERP_API_TOKEN:
         raise RuntimeError("FETCHSERP_API_TOKEN is not set")
 
     if name == "search":
-        query = arguments.get("query", "")
+        # Keyword volume
+        keyword = arguments.get("keyword")
+        if not keyword:
+            return {"content": [{"type": "text", "text": json.dumps({"error": "missing keyword"}, ensure_ascii=False)}]}
+
         params = {
-            "query": query,
-            "search_engine": arguments.get("search_engine", "google"),
+            "keyword": keyword,
             "country": arguments.get("country", "us"),
-            "pages_number": int(arguments.get("pages_number", 1)),
+            "language": arguments.get("language", "en"),
         }
-        top_k = int(arguments.get("top_k", 10))
-        data = await _call_fetchserp("/api/v1/serp", "GET", params)
-        results = data.get("results", [])[:top_k]
-        now = time.time()
-        items = []
-        for r in results:
-            url = r.get("url") or ""
-            pos = int(r.get("position") or 0)
-            _id = _stable_id(url, pos, query)
-            SEARCH_INDEX[_id] = {
-                "url": url,
-                "title": r.get("title"),
-                "snippet": r.get("snippet"),
-                "position": pos,
-                "query": query,
-                "ts": now,
-            }
-            items.append({"id": _id, "title": r.get("title"), "url": url, "snippet": r.get("snippet"), "position": pos})
-        _purge_expired()
-        return {"content": [{"type": "text", "text": json.dumps({"items": items}, ensure_ascii=False)}]}
+        data = await _call_fetchserp("/api/v1/keywords_search_volume", "GET", params)
+        # Pass through upstream response
+        return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}]}
 
     if name == "fetch":
-        ids: List[str] = list(arguments.get("ids") or [])
-        docs, missing = [], []
-        for _id in ids:
-            meta = SEARCH_INDEX.get(_id)
-            if not meta:
-                missing.append(_id)
-                continue
-            try:
-                res = await _call_fetchserp("/api/v1/scrape", "GET", {"url": meta["url"]})
-                html = res.get("html", "")
-            except httpx.HTTPStatusError:
-                html = ""
-            docs.append({"id": _id, "url": meta["url"], "title": meta.get("title"), "snippet": meta.get("snippet"), "html": html})
-        _purge_expired()
-        return {"content": [{"type": "text", "text": json.dumps({"docs": docs, "missing": missing}, ensure_ascii=False)}]}
-
-    if name in ENDPOINTS:
-        ep = ENDPOINTS[name]
-        params = {k: v for k, v in arguments.items()}
-        data = await _call_fetchserp(ep["path"], ep["method"], params)
+        url = arguments.get("url")
+        if not url:
+            return {"content": [{"type": "text", "text": json.dumps({"error": "missing url"}, ensure_ascii=False)}]}
+        data = await _call_fetchserp("/api/v1/scrape", "GET", {"url": url})
         return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}]}
 
     return {"content": [{"type": "text", "text": json.dumps({"error": f"Unknown tool: {name}"}, ensure_ascii=False)}]}
 
-# ---------- JSON-RPC dispatch ----------
+# -------------- JSON-RPC dispatch --------------
 def _negotiate_protocol(client_ver: Optional[str]) -> str:
-    if client_ver and client_ver in SUPPORTED_PROTOCOLS:
-        return client_ver
-    return LATEST_PROTOCOL
+    return client_ver if client_ver in SUPPORTED_PROTOCOLS else LATEST_PROTOCOL
 
-async def _mcp_dispatch(request_body: Dict[str, Any]) -> Dict[str, Any]:
-    method = request_body.get("method")
-    rid = request_body.get("id")
-    params = request_body.get("params") or {}
+async def _dispatch(body: Dict[str, Any]) -> Dict[str, Any]:
+    method = body.get("method")
+    rid = body.get("id")
+    params = body.get("params") or {}
 
     if method == "initialize":
         client_ver = None
         if isinstance(params, dict):
             client_ver = params.get("protocolVersion") or params.get("protocol_version")
-        agreed = _negotiate_protocol(client_ver)
-        result = {
-            "protocolVersion": agreed,
-            "capabilities": {
-                "tools": {},
-                "resources": {},
-                "prompts": {},
+        version = _negotiate_protocol(client_ver)
+        return _jsonrpc_result(
+            rid,
+            {
+                "protocolVersion": version,
+                "capabilities": {
+                    "tools": {},
+                    "resources": {},
+                    "prompts": {},
+                },
+                "serverInfo": {"name": APP_NAME, "version": APP_VERSION},
             },
-            "serverInfo": {"name": APP_NAME, "version": APP_VERSION},
-        }
-        return _jsonrpc_result(rid, result)
+        )
 
     if method in ("tools/list", "tools.list"):
         return _jsonrpc_result(rid, _tools_list_result())
 
-    # Optional features: empty lists instead of -32601
+    # Optional features: return empty lists instead of method not found
     if method in ("resources/list", "resources.list"):
         return _jsonrpc_result(rid, {"resources": []})
-    if method in ("resources/read", "resources.read"):
-        # Expect params: {"uri": "..."}
-        return _jsonrpc_result(rid, {"contents": []})
     if method in ("prompts/list", "prompts.list"):
         return _jsonrpc_result(rid, {"prompts": []})
-    if method in ("prompts/get", "prompts.get"):
-        # Expect params: {"name": "...", "arguments": {}}
-        return _jsonrpc_result(rid, {"messages": []})
 
     if method in ("tools/call", "tools.call"):
         name = params.get("name")
@@ -323,18 +206,13 @@ async def _mcp_dispatch(request_body: Dict[str, Any]) -> Dict[str, Any]:
             result = await _handle_tool_call(name, arguments)
             return _jsonrpc_result(rid, result)
         except httpx.HTTPStatusError as e:
-            data = {"status": e.response.status_code, "body": e.response.text}
-            return _jsonrpc_error(rid, -32001, "Upstream FetchSERP error", data)
+            return _jsonrpc_error(rid, -32001, "Upstream FetchSERP error", {"status": e.response.status_code, "body": e.response.text})
         except Exception as e:
             return _jsonrpc_error(rid, -32000, f"Server error: {str(e)}")
 
-    # Some clients send notifications without id. Acknowledge with success to reduce noise.
-    if method in ("notifications/initialized", "notifications/logMessage", "ping"):
-        return _jsonrpc_result(rid, {"ok": True})
-
     return _jsonrpc_error(rid, -32601, f"Method not found: {method}")
 
-# ---------- JSON-RPC handlers ----------
+# -------------- HTTP handlers --------------
 @app.post("/mcp")
 @app.post("/mcp/")
 async def mcp_handler(request: Request) -> Response:
@@ -346,16 +224,17 @@ async def mcp_handler(request: Request) -> Response:
             media_type="application/json",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
-    result = await _mcp_dispatch(body)
+    result = await _dispatch(body)
     return Response(content=json.dumps(result), media_type="application/json")
 
+# For clients that post to root
 @app.post("/")
-async def mcp_handler_root(request: Request) -> Response:
+async def mcp_root(request: Request) -> Response:
     return await mcp_handler(request)
 
 if __name__ == "__main__":
     import uvicorn
     if not FETCHSERP_API_TOKEN:
-        print("Warning: FETCHSERP_API_TOKEN is not set. Only tools that call FetchSERP will fail at runtime.")
-    print(f"Starting {APP_NAME} on 0.0.0.0:{PORT}")
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+        print("Warning: set FETCHSERP_API_TOKEN or search and fetch will fail at runtime")
+    print(f"Starting {APP_NAME} on 0.0.0.0:{os.getenv('PORT', '8000')}")
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
