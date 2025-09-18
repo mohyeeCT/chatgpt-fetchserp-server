@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 FetchSERP MCP server exposing core endpoints as MCP tools.
-- JSON-RPC at "/" and "/mcp/"
-- Includes search/fetch pair and all core endpoints
-- Adds aliases: keyword_volume -> keywords_search_volume, keyword_suggestions -> keywords_suggestions
+- JSON-RPC at "/" plus POST on "/mcp" and "/mcp/". GET on those paths returns a banner for humans.
+- Includes search/fetch pair and all core endpoints. Adds keyword_volume and keyword_suggestions aliases.
 """
 import os
 import json
@@ -16,7 +15,7 @@ from fastapi import FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
 APP_NAME = "FetchSERP MCP Server"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.3"
 MCP_PROTOCOL_REV = "2025-06-18"
 
 FETCHSERP_API_TOKEN = os.getenv("FETCHSERP_API_TOKEN")
@@ -26,7 +25,7 @@ PORT = int(os.getenv("PORT", "8000"))
 SEARCH_TTL_SEC = 20 * 60
 SEARCH_INDEX: Dict[str, Dict[str, Any]] = {}
 
-app = FastAPI(title=APP_NAME)
+app = FastAPI(title=APP_NAME)  # default redirect_slashes=True is fine
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,23 +35,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------- Health ----------
 @app.get("/")
 async def health_root():
     return {
         "ok": True,
         "app": APP_NAME,
         "version": APP_VERSION,
-        "mcp": {"protocolRevision": MCP_PROTOCOL_REV, "endpoints": ["/", "/mcp/"]},
+        "mcp": {"protocolRevision": MCP_PROTOCOL_REV, "endpoints": ["/", "/mcp", "/mcp/"]},
     }
 
-@app.get("/health")
-async def health():
-    return {"ok": True}
+# Humans sometimes open /mcp in a browser. Give a banner.
+@app.get("/mcp")
+@app.get("/mcp/")
+async def mcp_get_banner():
+    return {"ok": True, "message": "MCP JSON-RPC endpoint. Use POST to call JSON-RPC.", "methods": ["POST"]}
 
+# ---------- HTTP client ----------
 def _client() -> httpx.AsyncClient:
     headers = {"Authorization": f"Bearer {FETCHSERP_API_TOKEN}"}
     return httpx.AsyncClient(base_url=FETCHSERP_BASE_URL, headers=headers, timeout=90.0)
 
+# ---------- JSON-RPC helpers ----------
 def _jsonrpc_result(id_value: Any, result: Dict[str, Any]) -> Dict[str, Any]:
     return {"jsonrpc": "2.0", "id": id_value, "result": result}
 
@@ -62,18 +66,18 @@ def _jsonrpc_error(id_value: Any, code: int, message: str, data: Optional[Dict[s
         err["error"]["data"] = data
     return err
 
-# Map MCP tool name -> FetchSERP endpoint path and HTTP method
+# ---------- Endpoint map ----------
 ENDPOINTS = {
     # meta-tools
     "search": {"path": "/api/v1/serp", "method": "GET"},
     "fetch": {"path": "/api/v1/scrape", "method": "GET"},
 
-    # core endpoints (based on public SDK/docs)
+    # core endpoints
     "serp": {"path": "/api/v1/serp", "method": "GET"},
     "ranking": {"path": "/api/v1/ranking", "method": "GET"},
     "serp_html": {"path": "/api/v1/serp_html", "method": "GET"},
     "serp_text": {"path": "/api/v1/serp_text", "method": "GET"},
-    "serp_js": {"path": "/api/v1/serp_js", "method": "GET"},  # returns UUID in some flows
+    "serp_js": {"path": "/api/v1/serp_js", "method": "GET"},
     "serp_ai": {"path": "/api/v1/serp_ai", "method": "GET"},
     "serp_ai_mode": {"path": "/api/v1/serp_ai_mode", "method": "GET"},
     "page_indexation": {"path": "/api/v1/page_indexation", "method": "GET"},
@@ -82,9 +86,9 @@ ENDPOINTS = {
     "keywords_suggestions": {"path": "/api/v1/keywords_suggestions", "method": "GET"},
     "long_tail_keywords_generator": {"path": "/api/v1/long_tail_keywords_generator", "method": "GET"},
     "scrape": {"path": "/api/v1/scrape", "method": "GET"},
-    "scrape_js": {"path": "/api/v1/scrape_js", "method": "POST"},  # POST per SDK
-    "scrape_js_with_proxy": {"path": "/api/v1/scrape_js_with_proxy", "method": "POST"},  # POST per SDK
-    "domain_scraping": {"path": "/api/v1/scrape_domain", "method": "GET"},  # path per SDK
+    "scrape_js": {"path": "/api/v1/scrape_js", "method": "POST"},
+    "scrape_js_with_proxy": {"path": "/api/v1/scrape_js_with_proxy", "method": "POST"},
+    "domain_scraping": {"path": "/api/v1/scrape_domain", "method": "GET"},
     "web_page_seo_analysis": {"path": "/api/v1/web_page_seo_analysis", "method": "GET"},
     "web_page_ai_analysis": {"path": "/api/v1/web_page_ai_analysis", "method": "GET"},
     "domain_infos": {"path": "/api/v1/domain_infos", "method": "GET"},
@@ -96,16 +100,7 @@ ENDPOINTS = {
     "keyword_suggestions": {"path": "/api/v1/keywords_suggestions", "method": "GET"},
 }
 
-def _stable_id(url: str, position: int, query: str) -> str:
-    h = hashlib.sha1(f"{url}|{position}|{query}".encode("utf-8")).hexdigest()
-    return f"fsrp_{h[:24]}"
-
-def _purge_expired():
-    now = time.time()
-    expired = [k for k, v in SEARCH_INDEX.items() if now - v.get("ts", 0) > SEARCH_TTL_SEC]
-    for k in expired:
-        SEARCH_INDEX.pop(k, None)
-
+# ---------- Tool list ----------
 def _tools_list_result() -> Dict[str, Any]:
     def obj(props, required=None, additional=True):
         return {"type": "object", "properties": props, "required": required or [], "additionalProperties": additional}
@@ -117,55 +112,60 @@ def _tools_list_result() -> Dict[str, Any]:
         "pages_number": {"type": "integer", "minimum": 1, "maximum": 30, "default": 1},
     }
 
-    tools = []
-
-    # search + fetch
-    tools.append({
-        "name": "search",
-        "description": "Search and return top result IDs. Wraps /api/v1/serp.",
-        "inputSchema": obj({**common_search_props, "top_k": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}}, ["query"]),
-    })
-    tools.append({
-        "name": "fetch",
-        "description": "Fetch full documents by IDs returned from search. Uses /api/v1/scrape.",
-        "inputSchema": obj({"ids": {"type": "array", "items": {"type": "string"}}}, ["ids"], additional=False),
-    })
-
-    # core endpoints
-    tools += [
-        {"name": "serp", "description": "Structured SERP results.", "inputSchema": obj(common_search_props, ["query"])},
-        {"name": "ranking", "description": "Domain ranking for a keyword.", "inputSchema": obj({
-            "domain": {"type": "string"},
-            "keyword": {"type": "string"},
-            "country": {"type": "string", "default": "us"},
-            "search_engine": {"type": "string", "enum": ["google", "bing", "yahoo", "duckduckgo"], "default": "google"},
-            "pages_number": {"type": "integer", "minimum": 1, "maximum": 30, "default": 10},
-        }, ["domain", "keyword"])},
-        {"name": "serp_html", "description": "SERP with full HTML.", "inputSchema": obj(common_search_props, ["query"])},
-        {"name": "serp_text", "description": "SERP as extracted text.", "inputSchema": obj(common_search_props, ["query"])},
-        {"name": "serp_js", "description": "JS-rendered SERP job.", "inputSchema": obj(common_search_props, ["query"])},
-        {"name": "serp_ai", "description": "AI Overview + AI Mode.", "inputSchema": obj(common_search_props, ["query"])},
-        {"name": "serp_ai_mode", "description": "Cached US-only AI Mode.", "inputSchema": obj({"query": {"type": "string"}}, ["query"])},
-        {"name": "page_indexation", "description": "Check page indexation status.", "inputSchema": obj({"url": {"type": "string"}}, ["url"])},
-        {"name": "backlinks", "description": "Backlink data for a domain.", "inputSchema": obj({"domain": {"type": "string"}}, ["domain"])},
-        {"name": "keywords_search_volume", "description": "Monthly search volume for a keyword.", "inputSchema": obj({"keyword": {"type": "string"}}, ["keyword"])},
-        {"name": "keywords_suggestions", "description": "Keyword suggestions with metrics.", "inputSchema": obj({"keyword": {"type": "string"}}, ["keyword"])},
-        {"name": "long_tail_keywords_generator", "description": "Generate long-tail keywords.", "inputSchema": obj({"keyword": {"type": "string"}}, ["keyword"])},
-        {"name": "scrape", "description": "Scrape raw HTML.", "inputSchema": obj({"url": {"type": "string"}}, ["url"])},
-        {"name": "scrape_js", "description": "Scrape with custom JS.", "inputSchema": obj({"url": {"type": "string"}, "script": {"type": "string"}}, ["url"])},
-        {"name": "scrape_js_with_proxy", "description": "JS scrape via proxy.", "inputSchema": obj({"url": {"type": "string"}, "script": {"type": "string"}}, ["url"])},
-        {"name": "domain_scraping", "description": "Crawl a domain.", "inputSchema": obj({"domain": {"type": "string"}}, ["domain"])},
-        {"name": "web_page_seo_analysis", "description": "Technical and on-page SEO audit.", "inputSchema": obj({"url": {"type": "string"}}, ["url"])},
-        {"name": "web_page_ai_analysis", "description": "AI-powered content analysis.", "inputSchema": obj({"url": {"type": "string"}}, ["url"])},
-        {"name": "domain_infos", "description": "DNS, WHOIS, tech stack.", "inputSchema": obj({"domain": {"type": "string"}}, ["domain"])},
-        {"name": "domain_emails", "description": "Extract emails from a domain.", "inputSchema": obj({"domain": {"type": "string"}}, ["domain"])},
-        {"name": "moz", "description": "Moz authority and metrics.", "inputSchema": obj({"domain": {"type": "string"}}, ["domain"])},
-        {"name": "keyword_volume", "description": "Alias of keywords_search_volume.", "inputSchema": obj({"keyword": {"type": "string"}}, ["keyword"])},
-        {"name": "keyword_suggestions", "description": "Alias of keywords_suggestions.", "inputSchema": obj({"keyword": {"type": "string"}}, ["keyword"])},
+    tools = [
+        {
+            "name": "search",
+            "description": "Search and return top result IDs. Wraps /api/v1/serp.",
+            "inputSchema": obj({**common_search_props, "top_k": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}}, ["query"]),
+        },
+        {
+            "name": "fetch",
+            "description": "Fetch full documents by IDs returned from search. Uses /api/v1/scrape.",
+            "inputSchema": obj({"ids": {"type": "array", "items": {"type": "string"}}}, ["ids"], additional=False),
+        },
     ]
+
+    def add_passthrough(name, desc, props, req):
+        tools.append({"name": name, "description": desc, "inputSchema": obj(props, req)})
+
+    add_passthrough("serp", "Structured SERP results.", common_search_props, ["query"])
+    add_passthrough("ranking", "Domain ranking for a keyword.", {
+        "domain": {"type": "string"},
+        "keyword": {"type": "string"},
+        "country": {"type": "string", "default": "us"},
+        "search_engine": {"type": "string", "enum": ["google", "bing", "yahoo", "duckduckgo"], "default": "google"},
+        "pages_number": {"type": "integer", "minimum": 1, "maximum": 30, "default": 10},
+    }, ["domain", "keyword"])
+
+    for t in [
+        ("serp_html", "SERP with full HTML."),
+        ("serp_text", "SERP as extracted text."),
+        ("serp_js", "JS-rendered SERP job."),
+        ("serp_ai", "AI Overview + AI Mode."),
+    ]:
+        add_passthrough(t[0], t[1], common_search_props, ["query"])
+
+    add_passthrough("serp_ai_mode", "Cached US-only AI Mode.", {"query": {"type": "string"}}, ["query"])
+    add_passthrough("page_indexation", "Check page indexation status.", {"url": {"type": "string"}}, ["url"])
+    add_passthrough("backlinks", "Backlink data for a domain.", {"domain": {"type": "string"}}, ["domain"])
+    add_passthrough("keywords_search_volume", "Monthly search volume for a keyword.", {"keyword": {"type": "string"}}, ["keyword"])
+    add_passthrough("keywords_suggestions", "Keyword suggestions with metrics.", {"keyword": {"type": "string"}}, ["keyword"])
+    add_passthrough("long_tail_keywords_generator", "Generate long-tail keywords.", {"keyword": {"type": "string"}}, ["keyword"])
+    add_passthrough("scrape", "Scrape raw HTML.", {"url": {"type": "string"}}, ["url"])
+    add_passthrough("scrape_js", "Scrape with custom JS.", {"url": {"type": "string"}, "script": {"type": "string"}}, ["url"])
+    add_passthrough("scrape_js_with_proxy", "JS scrape via proxy.", {"url": {"type": "string"}, "script": {"type": "string"}}, ["url"])
+    add_passthrough("domain_scraping", "Crawl a domain.", {"domain": {"type": "string"}}, ["domain"])
+    add_passthrough("web_page_seo_analysis", "Technical and on-page SEO audit.", {"url": {"type": "string"}}, ["url"])
+    add_passthrough("web_page_ai_analysis", "AI-powered content analysis.", {"url": {"type": "string"}}, ["url"])
+    add_passthrough("domain_infos", "DNS, WHOIS, tech stack.", {"domain": {"type": "string"}}, ["domain"])
+    add_passthrough("domain_emails", "Extract emails from a domain.", {"domain": {"type": "string"}}, ["domain"])
+    add_passthrough("moz", "Moz authority and metrics.", {"domain": {"type": "string"}}, ["domain"])
+    add_passthrough("keyword_volume", "Alias of keywords_search_volume.", {"keyword": {"type": "string"}}, ["keyword"])
+    add_passthrough("keyword_suggestions", "Alias of keywords_suggestions.", {"keyword": {"type": "string"}}, ["keyword"])
 
     return {"tools": tools}
 
+# ---------- Tool execution ----------
 async def _call_fetchserp(endpoint: str, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
     async with _client() as client:
         if method == "GET":
@@ -174,6 +174,16 @@ async def _call_fetchserp(endpoint: str, method: str, params: Dict[str, Any]) ->
             r = await client.post(endpoint, json=params)
         r.raise_for_status()
         return r.json()
+
+def _stable_id(url: str, position: int, query: str) -> str:
+    h = hashlib.sha1(f"{url}|{position}|{query}".encode("utf-8")).hexdigest()
+    return f"fsrp_{h[:24]}"
+
+def _purge_expired():
+    now = time.time()
+    expired = [k for k, v in SEARCH_INDEX.items() if now - v.get("ts", 0) > SEARCH_TTL_SEC]
+    for k in expired:
+        SEARCH_INDEX.pop(k, None)
 
 async def _handle_tool_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     if not FETCHSERP_API_TOKEN:
@@ -233,6 +243,7 @@ async def _handle_tool_call(name: str, arguments: Dict[str, Any]) -> Dict[str, A
 
     return {"content": [{"type": "text", "text": json.dumps({"error": f"Unknown tool: {name}"}, ensure_ascii=False)}]}
 
+# ---------- JSON-RPC dispatch ----------
 async def _mcp_dispatch(request_body: Dict[str, Any]) -> Dict[str, Any]:
     method = request_body.get("method")
     rid = request_body.get("id")
@@ -263,6 +274,8 @@ async def _mcp_dispatch(request_body: Dict[str, Any]) -> Dict[str, Any]:
 
     return _jsonrpc_error(rid, -32601, f"Method not found: {method}")
 
+# ---------- JSON-RPC handlers ----------
+@app.post("/mcp")
 @app.post("/mcp/")
 async def mcp_handler(request: Request) -> Response:
     try:
